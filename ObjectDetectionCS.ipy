@@ -1,0 +1,1022 @@
+import json
+from PIL import Image as Imagem
+import boto3
+from pprint import pprint
+from sklearn.model_selection import train_test_split
+
+s3 = boto3.client("s3")
+bucket = "sagemaker72"
+reko_bucket= "customlabels72"
+input_path = "cl-demo/input"
+reko_manifest_path = "cl-demo"
+output_path = "cl-demo/output"
+
+comprehend = boto3.client(service_name='comprehend', region_name='us-east-1')
+reko = boto3.client("rekognition")
+
+
+class BoundingBox(object):
+    def __init__(self, x, y, width, height):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    def __repr__(self):
+        return str(self.__dict__)
+    
+class Token(object):
+    def __init__(self, TokenId, Text, BeginOffset, EndOffset, Tag, Score):
+        assert Score > 0.9, 'Not enough confidence on tag'
+        self.TokenId = TokenId
+        self.Text = Text
+        self.LowerText = Text.lower()
+        self.BeginOffset = BeginOffset
+        self.EndOffset = EndOffset
+        self.Tag = Tag
+        self.Score = Score
+    def __repr__(self):
+        return str(self.__dict__)
+
+        
+class ImageAnnotation(object):
+    COLORS = {'blue', 'red', 'yellow', 'green', 'white', 'silver', 'gray', 'grey', 'orange', 'black', 'brown', 'pink', 'purple', 'while'}
+    STOPWORDS = {'elevens', 'fivr', 'plie', 'thirteens', 'pile', 'piles'}
+    
+    def __init__(self, index, bounding_box, phrase, comprehend=None):
+	  
+        self.bb = bounding_box
+        self.index = index
+        self.phrase = phrase
+        if (comprehend):
+            self.update_tokens(comprehend)
+        else:
+            self.Tokens = None
+            self.obj_class = None
+        
+    def _gen_tokens(self, comprehend):
+        return(comprehend.detect_syntax(LanguageCode='en', Text=self.phrase)['SyntaxTokens'])
+    
+    def update_tokens(self, comprehend):
+        self.Tokens = self._gen_tokens(comprehend) if len(self.phrase) else None
+        if self.Tokens and len(self.Tokens):
+            self.obj_class = self.get_class()
+        else:
+            self.obj_class = None
+        
+    def get_class(self):
+        assert self.Tokens, "No tokenization available for class extraction"
+        def get_object(tokens):
+            noun_part = []
+            for token in tokens:
+                if token['PartOfSpeech']['Tag'] == 'VERB':
+                    break
+                if token['Text'].lower() in ImageAnnotation.COLORS:
+                    continue
+                if token['Text'].lower() in ImageAnnotation.STOPWORDS:
+                    continue
+                if token['PartOfSpeech']['Tag'] in ('ADJ', 'NOUN', 'PROPN'):
+                    noun_part.append(token)
+            return ' '.join([x['Text'] for x in noun_part])
+        result = get_object(self.Tokens)
+        if len(result) > 0:
+            result = result[:-1] if result[-1] == 's' else result
+        return(result)
+        
+    def __repr__(self):
+        return str(self.__dict__)
+
+
+class Image(object):
+    def __init__(self, path, filename, size, annotations):
+        self.path = path
+        self.filename = filename
+        self.size = size
+        self.annotations = annotations
+        im = Imagem.open(f"{self.path}/{self.filename}")
+        self.width, self.height = im.size
+        self.classify_image()
+        
+    def classify_image(self):
+        self.obj_classes = {annotation.obj_class for annotation in self.annotations if annotation.obj_class}
+    
+    def gen_tokens(self, comprehend):
+        for annot in self.annotations:
+            annot.update_tokens(comprehend)
+            
+    def __repr__(self):
+        return str(self.__dict__)
+
+
+def load_images(path, manifest_file, comprehend=None):
+    with open(manifest_file, "r") as source_manifest:
+        manifest = json.load(source_manifest)
+    images = []
+    for _, image in manifest.items():
+        try:
+            try:
+                annotations = []
+                for (index, annotation) in image['regions'].items():
+                    shape_attrs = annotation['shape_attributes']
+                    shape_attrs.pop('name')
+                    phrase = annotation['region_attributes']['phrase']
+                    img = ImageAnnotation(index, BoundingBox(**shape_attrs), phrase, comprehend)
+                    if img.obj_class and len(img.obj_class):
+                        annotations.append(img)
+            except:
+                pprint(annotation['shape_attributes'])
+                raise
+            images.append(
+                Image(path, image['filename'], image['size'], annotations)
+            )
+        except:
+            pprint(image)
+            raise
+    return(images)
+
+
+image_objs = load_images("data/UAVdata", "data/via_region_data_final.json", comprehend)
+[image.classify_image() for image in image_objs]
+
+
+
+
+def split_data(image_objs, pct_train=0.5, random_state=None):
+    classified_images = [image for image in image_objs if len(image.obj_classes) > 0]
+    unclassified_images = [image for image in image_objs if len(image.obj_classes) == 0]
+    train_images, test_images = train_test_split(classified_images, train_size=pct_train, random_state=random_state)
+    return(train_images, test_images, unclassified_images)
+
+
+
+num_examples=2
+train_data, test_data_full, unclassified = split_data(image_objs , pct_train=1)
+test_data = test_data_full[:num_examples]
+unused_data = test_data_full[num_examples:]
+
+
+
+len(train_data), len(test_data)
+
+
+from collections import Counter
+
+class_map = {classif: i+1 for (i, (classif, _)) in
+             enumerate(
+                 Counter(
+                     [an.obj_class for image in train_data for an in image.annotations if an.obj_class and len(an.obj_class)]
+                 ).most_common(34)
+             )}
+
+
+
+def gen_manifest(image, class_map, s3_path, job_number=0, max_annotations=None, indent=None):
+    img_annotations = image.annotations if max_annotations is None else image.annotations[:max_annotations]
+    class_map['others'] = 0
+
+
+                                                                                
+
+
+
+    classes_in_img = {an.obj_class for an in img_annotations}
+    if len(classes_in_img.difference(class_map.keys())):
+        classes_in_img.add('others')
+    annotations = [{
+        "class_id": class_map.get(an.obj_class, 0),
+        "left": an.bb.x,
+        "top": an.bb.y,
+        "width": an.bb.width,
+        "height": an.bb.height
+    } for an in img_annotations]
+    
+    manifest = {
+        "source-ref": f'{s3_path}/{image.filename}',
+        "bounding-box": { 
+            "image_size": [
+                {
+                    "width": image.width,
+                    "height": image.height,
+                    "depth": 3 
+                }
+            ],
+            "annotations": annotations
+        },
+        "bounding-box-metadata": { 
+            "objects": [ {"confidence": 0.9} for _ in img_annotations ],
+            "class-map": {v: k for k, v in class_map.items() if k in classes_in_img},
+            "type": "groundtruth/object-detection",
+            "human-annotated": "yes",
+            "creation-date": "2020-02-25T22:50:05.0000z",
+            "job-name": f"identify-construction-objs-{job_number}"
+        }
+     }
+    return(json.dumps(manifest, indent=indent))
+
+def save_manifest(data, path, job_number=0, max_annotations=5):
+    s3_path = f"s3://{bucket}/{input_path}"
+    with open(path, 'w') as outfile:
+        for example in data:
+            outfile.write(f"{gen_manifest(example, class_map, s3_path, max_annotations=max_annotations, job_number=job_number)}\n")
+
+
+
+job_number = 4
+manifest_version = f"{num_examples}_v{job_number}"
+
+
+
+
+save_manifest(train_data, f'data/train_{manifest_version}.manifest', job_number=job_number)
+save_manifest(test_data, f'data/test_{manifest_version}.manifest', job_number=job_number)
+
+
+
+
+class Schemas:
+    """
+    Schema Definitions
+    """
+
+    SOURCE_SCHEMA = {
+        "type": "object",
+        "required": [
+            "source-ref"
+        ],
+        "properties": {
+            "source-ref": {
+                "description": "Image S3 image URL",
+                "type": "string",
+                "pattern": "^s3://([^/]+)/(.*)$"
+            }
+        },
+        "additionalProperties": False,
+        'maxItems': 1,
+        'minItems': 1
+    }
+
+    ATTRIBUTE_SCHEMA = {
+        "definitions": {
+            "image_size": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "width",
+                        "height",
+                        "depth"
+                    ],
+                    "properties": {
+                        "width": {
+                            "$ref": "#/definitions/image_dimension"
+                        },
+                        "height": {
+                            "$ref": "#/definitions/image_dimension"
+                        },
+                        "depth": {
+                            "type": "number",
+                            "min": 1,
+                            "max": 3
+                        }
+                    }
+                }
+            },
+            "annotations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "width",
+                        "height",
+                        "top",
+                        "left",
+                        "class_id"
+                    ],
+                    "properties": {
+                        "width": {
+                            "type": "number"
+                        },
+                        "height": {
+                            "type": "number"
+                        },
+                        "top": {
+                            "type": "number"
+                        },
+                        "left": {
+                            "type": "number"
+                        },
+                        "class_id": {
+                            "type": "integer"
+                        }
+                    }
+                }
+            },
+            "image_dimension": {
+                "type": "number",
+                "minimum": 64,
+                "maximum": 4096
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0
+            },
+            "objects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "confidence"
+                    ],
+                    "properties": {
+                        "confidence": {
+                            "$ref": "#/definitions/confidence"
+                        }
+                    }
+                }
+            }
+        },
+        "patternProperties": {
+            "^[A-Za-z0-9-]+": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "description": "Detection label data",
+                        "properties": {
+                            "annotations": {
+                                "$ref": "#/definitions/annotations"
+                            },
+                            "image_size": {
+                                "$ref": "#/definitions/image_size"
+                            }
+                        },
+                        "required": [
+                            "annotations",
+                            "image_size"
+                        ]
+                    },
+                    {
+                        "description": "Classification label data",
+                        "type": ["integer", "string"]
+                    }
+                ]
+            }
+        },
+        'minItems': 1
+    }
+
+    METADATA_SCHEMA = {
+        "definitions": {
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0
+            },
+            "class-map": {
+                "type": "object",
+                "propertyNames": {"pattern": "^[0-9]+"},
+                "patternProperties": {"": {"type": "string", "minLength": 1, "maxLength": 256}}
+            },
+            "objects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "confidence"
+                    ],
+                    "properties": {
+                        "confidence": {
+                            "$ref": "#/definitions/confidence"
+                        }
+                    }
+                }
+            }
+        },
+        "patternProperties": {
+            "^[A-Za-z0-9-]+": {
+                "description": "Ground Truth label metadata",
+                "properties": {
+                    "class-map": {
+                        "$ref": "#/definitions/class-map"
+                    },
+                    "human-annotated": {
+                        "type": "string",
+                        "enum": ["yes", "no"]
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["groundtruth/image-classification", "groundtruth/object-detection"]
+                    },
+                    "creation-date": {
+                        "type": "string",
+                        "format": "date-time"
+                    },
+                    "confidence": {
+                        "$ref": "#/definitions/confidence"
+                    },
+                    "class-name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                    },
+                    "objects": {
+                        "$ref": "#/definitions/objects"
+                    }
+                },
+                "required": [
+                    "human-annotated",
+                    "type",
+                    "creation-date"
+                ],
+                "oneOf": [
+                    {
+                        "required": [
+                            "confidence",
+                            "class-name"
+                        ]
+                    },
+                    {
+                        "required": [
+                            "class-map",
+                            "objects"
+                        ]
+                    }
+                ]
+            }
+        },
+        'minItems': 5
+    }
+
+AUTO_ML_SERVICE_INPUT_BUCKET = "rekognition-automl-training"
+AUTO_ML_SERVICE_ARTIFACTS_BUCKET = "rekognition-automl-models"
+AUTO_ML_MODEL_ZOO_ARTIFACTS_BUCKET = "rekognition-automl-modelzoo"
+
+ACCOUNT_ID = "AccountId"
+PROJECT_ID = "ProjectId"
+VERSION_NAME = "VersionName"
+PROJECT_VERSION_ARN = "ProjectVersionArn"
+S3_PROJECT_PREFIX = "S3ProjectVersionPrefix"
+HPO_JOB_NAME_OVERWRITE = "HPOJobName"
+USE_CASE = "UseCase"
+EXECUTION_START_TIME = "executionStartTime"
+
+REGION = "region"
+SERVICE_ACCOUNT_ID = "service_account_id"
+VERSION = "version"
+
+
+DATASETS_KEY = "Datasets"
+USE_TYPE_KEY = "UseType"
+GT_MANIFEST_KEY = "GroundTruthManifest"
+S3_OBJECT_KEY = "S3Object"
+TRAIN_MANIFEST_TYPE = "TRAINING"
+TEST_MANIFEST_TYPE = "TESTING"
+OUTPUT_CONFIG_OWNER_ID_KEY = "OutputConfigOwnerId"
+TRAIN_DATASET_OWNER_ID_KEY = "TrainDatasetOwnerId"
+TEST_DATASET_OWNER_ID_KEY = "TestDatasetOwnerId"
+
+
+SOURCE_REF = "source-ref"
+ORIGINAL_SOURCE = "original-source"
+METADATA_SUFFIX = "metadata"
+ATTRIBUTE_ANNOTATIONS = "annotations"
+ATTRIBUTE_IMAGE_SIZE = "image_size"
+ATTRIBUTE_IMAGE_WIDTH = "width"
+ATTRIBUTE_IMAGE_HEIGHT = "height"
+ATTRIBUTE_IMAGE_LEFT = "left"
+ATTRIBUTE_IMAGE_TOP = "top"
+METADATA_CLASS_MAP = "class-map"
+METADATA_CLASS_NAME = "class-name"
+METADATA_CLASS_ID = "class_id"
+METADATA_OBJECTS = "objects"
+METADATA_HUMAN_ANNOTATED = "human-annotated"
+METADATA_CONFIDENCE = "confidence"
+METADATA_JOB_NAME = "job-name"
+METADATA_TYPE = "type"
+METADATA_CREATION_DATE = "creation-date"
+LABEL_TYPE_CLASSIFICATION = "image-classification"
+LABEL_TYPE_DETECTION = "object-detection"
+GROUND_TRUTH_TYPE_PREFIX = "groundtruth/"
+
+LABEL = "label"  
+ANNOTATION_TYPE = "annotation-type"  
+LINE_INDEX = "line-idx"  
+IMAGE_RESIZE_RATIO = "resize-ratio"
+
+
+
+AUTOML_OBJECT_ID = "rekognition-custom-labels-object-id"
+AUTOML_JOB_NAME = "rekognition-custom-labels-training-job"
+AUTOML_LABEL = "rekognition-custom-labels-training"
+
+JSON_EXT = ".json"
+CSV_EXT = ".csv"
+UTF_8 = "utf-8"
+
+
+TRAINING_MANIFEST = TRAIN_MANIFEST_TYPE + JSON_EXT
+TESTING_MANIFEST = TEST_MANIFEST_TYPE + JSON_EXT
+VALIDATED_GT_MANIFEST_SUFFIX = "_gt"  
+VALIDATED_MANIFEST_STATS_SUFFIX = '_stats' 
+VALIDATED_MANIFEST_STATS_AFTER_FILTER_SUFFIX = '_stats_after_filter'  
+PRESPLIT_MANIFEST = "_presplit"  
+SM_MANIFEST = "SageMakerManifest"
+GT_MANIFEST = "GroundTruthManifest"
+VALID_SUFFIX = "_valid"  
+SPLIT_SUFFIX = "_split"  
+MIN_DATASET_CLASSES = 2
+MAX_DATASET_CLASSES = 250
+
+S3_PREFIX = "s3://"
+CONTENT_LENGTH = "ContentLength"
+CHUNK_SIZE_IN_BYTES = 200*1024*1024  
+MIN_MULTIPART_UPLOAD_CHUNK_SIZE = 5*1024*1024  
+MAX_MULTIPART_UPLOAD_CHUNK_SIZE = 5*1024*1024*1024  
+MOCK_S3_BUCKET_OWNER_ID = '75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a' 
+
+MAX_DATASET_OBJECTS = 250000
+ONE_GB_IN_BYTES = 1*1024*1024*1024
+MAX_MANIFEST_FILE_SIZE_IN_BYTES = ONE_GB_IN_BYTES
+MAX_IMAGE_SIZE_IN_BYTES = 15*1024*1024  
+MAX_IMAGE_DIMENSION = 4096  
+MIN_IMAGE_DIMENSION = 64  
+RESIZE_IMAGE_DIMENSION = 1280  
+MAX_RESIZED_IMAGE_IN_BYTES = RESIZE_IMAGE_DIMENSION * RESIZE_IMAGE_DIMENSION * 3  
+S3_VERSION = "Version"
+JPEG_QUALITY = 100
+
+
+
+TEST_SPLIT_RATIO = 0.2
+MIN_EXPECTED_NUM_CLASS_LABELS = 2
+MAX_BBS_PER_IMAGE = 50
+MAX_DATASET_ERROR_THRESHOLD_PERCENT = 20  
+PERCENT_100 = 100
+MIN_TEST_TRAIN_OVERLAP_PERCENT = 50 
+MIN_BB_DIMENSION = 1.0  
+
+BATCH_MANIFEST_FORMAT = "S3BatchOperations_CSV_20180820"
+BATCH_REPORT_FORMAT = "Report_CSV_20180820"
+BATCH_COPY_PREFIX = "/copy" 
+BATCH_VALIDATE_PREFIX = "/image_validation" 
+BATCH_REPORT_PREFIX = "/report"
+BATCH_REPORT_MANIFEST_JSON = "manifest.json"
+BATCH_REPORT_JOB_PREFIX = "job"
+TASK_SUCCEEDED = "succeeded"
+TASK_FAILED = "failed"
+
+
+BATCH_COPY_RESULT = "BatchCopyResult"
+BATCH_COPY_JOBS = "BatchCopyJobIds"
+IMAGE_VALIDATION_RESULT = "ImageValidationResult"
+IMAGE_VALIDATION_JOBS = "ImageValidationJobIds"
+INPUT_DATASET_SIZE = "DatasetSize"  
+VALID_TRAINING_DATASET_SIZE = "ValidTrainingDatasetSize"  
+VALID_TESTING_DATASET_SIZE = "ValidTestingDatasetSize"  
+
+IMAGE_VALIDATION_PERMANENT_FAILURE = "PermanentFailure"
+IMAGE_VALIDATION_SUCCESS = "Succeeded"
+
+
+IMAGE_VALIDATION_FUNCTION = "ImageValidationFunction"
+
+
+MODEL_GRAPH_DICTIONARY = "ModelGraphDictionary"
+MODEL_ZOO_VERSION = "model_zoo_version"
+
+
+MZOO_TECHNIQUE_FINETUNING = "FINETUNING"
+MZOO_TECHNIQUE_MULTISTAGE = "MULTISTAGE"
+MZOO_TECHNIQUE_INSTANCE_MATCH = "INSTANCEMATCH"
+MZOO_USE_CASE_CLASSIFICATION = "CLASSIFICATION"
+MZOO_USE_CASE_DETECTION = "DETECTION"
+
+
+
+TRAINING_INSTANCE_TYPE = "ml.p3.2xlarge"
+
+
+WORKFLOW_OUTPUT = "WorkflowOutput"
+
+JOB_STATUS = "jobStatus"
+CHILD_WORKFLOW_EXECUTION_STARTTIME = "childWorkflowExecutionStartTime"
+WORKFLOW_NAME = "workflowName"
+
+JOB_STATUS_SUCCEED = "SUCCEED"
+JOB_STATUS_CLIENT_ERROR = "CLIENT_ERROR"
+JOB_STATUS_SERVICE_ERROR = "SERVICE_ERROR"
+IS_AUTOSPLIT_KEY = 'IS_AUTOSPLIT'
+
+
+
+
+import logging
+import jsonlines
+from jsonlines.jsonlines import InvalidLineError
+import fastjsonschema
+
+
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class GroundTruthManifestStatistics:
+    """
+    Manifest statistics
+    """
+    def __init__(self):
+        self.total_line_count = 0
+        self.source_ref_only_line_count = 0
+        self.valid_line_count = 0
+        self.valid_annotations = 0
+        self.invalid_annotations = 0
+
+    def __add__(self, stats):
+        self.total_line_count += stats.total_line_count
+        self.source_ref_only_line_count += stats.source_ref_only_line_count
+        self.valid_line_count += stats.valid_line_count
+        self.valid_annotations += stats.valid_annotations
+        self.invalid_annotations += stats.invalid_annotations
+        return self
+
+    def get_total_line_without_source_ref_only_line(self):
+       
+        return self.total_line_count - self.source_ref_only_line_count
+
+    def __eq__(self, stats):
+        try:
+            return self.total_line_count == stats.total_line_count                 and self.source_ref_only_line_count == self.source_ref_only_line_count                 and self.valid_line_count == stats.valid_line_count                 and self.valid_annotations == stats.valid_annotations                 and self.invalid_annotations == stats.invalid_annotations
+        except AttributeError:
+            return False
+
+    def __str__(self):
+        return "total line:{0}, source_ref_only:{1}, valid_line:{2}, valid_annotations:{3}, invalid_annotations:{4}"            .format(self.total_line_count, self.source_ref_only_line_count, self.valid_line_count,
+                    self.valid_annotations, self.invalid_annotations)
+
+
+class GroundTruthManifestValidator:
+    """
+    Manifest validation class
+    """
+
+    def __init__(self):
+
+        self.source_validator = fastjsonschema.compile(Schemas.SOURCE_SCHEMA)
+        self.metadata_validator = fastjsonschema.compile(Schemas.METADATA_SCHEMA)
+        self.attribute_validator = fastjsonschema.compile(Schemas.ATTRIBUTE_SCHEMA)
+
+    def _transform_attribute_and_metadata(self, attribute, metadata):
+        """Extract necessary fields
+        Currently we only retain fields which can fit into OpenImage format used by science training code
+
+        :param attribute: attribute info
+        :param metadata: metadata info
+        :return: validated label
+        """
+
+        valid_label = {}
+        if LABEL_TYPE_CLASSIFICATION in metadata[METADATA_TYPE]:
+            
+            valid_label[METADATA_CLASS_NAME] = metadata[METADATA_CLASS_NAME]
+            valid_label[METADATA_CONFIDENCE] = metadata[METADATA_CONFIDENCE]
+            valid_label[METADATA_HUMAN_ANNOTATED] = metadata[METADATA_HUMAN_ANNOTATED]
+            valid_label[METADATA_CREATION_DATE] = metadata[METADATA_CREATION_DATE]
+            valid_label[ANNOTATION_TYPE] = LABEL_TYPE_CLASSIFICATION
+        else:
+          
+            valid_label[METADATA_HUMAN_ANNOTATED] = metadata[METADATA_HUMAN_ANNOTATED]
+            valid_label[METADATA_OBJECTS] = metadata[METADATA_OBJECTS]
+            valid_label[METADATA_CLASS_MAP] = metadata[METADATA_CLASS_MAP]
+            valid_label[ATTRIBUTE_ANNOTATIONS] = attribute[ATTRIBUTE_ANNOTATIONS]
+            valid_label[ATTRIBUTE_IMAGE_SIZE] = attribute[ATTRIBUTE_IMAGE_SIZE]
+            valid_label[METADATA_CREATION_DATE] = metadata[METADATA_CREATION_DATE]
+            valid_label[ANNOTATION_TYPE] = LABEL_TYPE_DETECTION
+
+        return valid_label
+
+    def _perform_deep_annotation_check(self, attribute, metadata, current_manifest_stats, line_number):
+        """Perform deep checks across attribute and its metadata
+
+        :param annotation: annotation
+        :return: annotation if valid, None if invalid
+        """
+        annotation = self._transform_attribute_and_metadata(attribute, metadata)
+        if LABEL_TYPE_DETECTION in annotation[ANNOTATION_TYPE]:
+          
+            if len(annotation[ATTRIBUTE_ANNOTATIONS]) != len(annotation[METADATA_OBJECTS]):
+                current_manifest_stats.invalid_annotations += 1
+                LOGGER.info("line %s: Ground truth annotation does not contain valid confidence objects", line_number)
+                print(f"line {line_number}: Ground truth annotation does not contain valid confidence objects" )
+                return None
+
+           
+            for bounding_box in annotation[ATTRIBUTE_ANNOTATIONS]:
+                if str(bounding_box[METADATA_CLASS_ID]) not in annotation[METADATA_CLASS_MAP]:
+                    current_manifest_stats.invalid_annotations += 1
+                    LOGGER.info("line %s: Ground truth annotation does not contain valid class_id: %s",
+                                line_number, str(bounding_box[METADATA_CLASS_ID]))
+                    print(f"line {line_number}: Ground truth annotation does not contain valid class_id: {str(bounding_box[METADATA_CLASS_ID])}")
+                    print(f"BB Metadata: {str(bounding_box[METADATA_CLASS_ID])}\n Annotation: {annotation[METADATA_CLASS_MAP]}")
+                    return None
+
+        return annotation
+
+    def _is_valid_source_ref(self, line, line_number):
+        """
+        Validate if this line contains a valid source-ref value that matches specified JSONSchema
+        """
+        if SOURCE_REF not in line:
+            LOGGER.info("line %s: Ground truth annotation does not contain valid image source reference", line_number)
+            print(f"line {line_number}: Ground truth annotation does not contain valid image source reference")
+            return False
+        try:
+            self.source_validator({SOURCE_REF: line[SOURCE_REF]})
+        except fastjsonschema.exceptions.JsonSchemaException:
+            LOGGER.info("line %s: Invalid image source reference format", line_number)
+            print(f"line {line_number}: Invalid image source reference format")
+            return False
+        return True
+
+    def _get_attributes_from_line(self, line, line_number):
+        """Validate each GT manifest line entry and create list of annotations
+
+        :param line: GT manifest JSON line
+        :return: Returns image source and list of valid annotations
+        """
+        attributes = {k: v for k, v in line.items() if f'{k}-{METADATA_SUFFIX}' in line}
+        if not attributes:
+            LOGGER.info("line %s: Ground truth annotation does not contain any valid attributes", line_number)
+            print(f"line {line_number}: Ground truth annotation does not contain any valid attributes")
+            return None
+        return attributes
+
+    def _source_ref_only(self, line):
+     
+        return len(line.keys()) == 1
+
+    def _validate_line(self, line, attributes, line_number, current_manifest_stats):
+        # Validate attribute and metadata against schema and populate necessary fields
+        valid_annotations = []
+        for key, value in attributes.items():
+            metadata_key = f'{key}-{METADATA_SUFFIX}'
+            try:
+                self.attribute_validator({key: value})
+                self.metadata_validator({metadata_key: line[metadata_key]})
+                valid_annotation = self._perform_deep_annotation_check(
+                    line[key], line[metadata_key], current_manifest_stats, line_number)
+                if valid_annotation:
+                    valid_annotations.append(valid_annotation)
+                    current_manifest_stats.valid_annotations += 1
+            except fastjsonschema.exceptions.JsonSchemaException as exc:
+                current_manifest_stats.invalid_annotations += 1
+                LOGGER.info("line %s: Invalid annotation for attribute", line_number)
+                print(f"line {line_number}: Invalid annotation for attribute")
+                LOGGER.debug("line %s: Invalid annotation for attribute: %s due to: %s", line_number, key, exc)
+                print(f"line {line_number}: Invalid annotation for attribute: {key} due to: {exc}")
+
+        return {SOURCE_REF: line[SOURCE_REF], LABEL: valid_annotations, LINE_INDEX: line_number} if valid_annotations             else None
+
+    def validate_manifest(self, manifest, existing_manifest_stats):
+        """
+
+        :param manifest: manifest file
+        :param existing_manifest_stats: contains the statistics of existing
+        manifest file
+        :return: manifest and stats
+        """
+        sanitized_manifest = []
+        line_number = existing_manifest_stats.total_line_count + 1
+        current_manifest_stats = GroundTruthManifestStatistics()
+        reader = jsonlines.Reader(manifest)
+        while True:
+            line = None
+            try:
+                line = reader.read(type=dict)
+            except (InvalidLineError, UnicodeDecodeError) as exc:
+                LOGGER.debug("line %s: Unexpected jsonline error in manifest: %s", line_number, exc)
+                print(f"line {line_number}: Unexpected jsonline error in manifest: {exc}")
+            except EOFError:
+                LOGGER.info("line %s: Finished parsing manifest file (not all are necessarily valid)", line_number)
+                print(f"line {line_number}: Finished parsing manifest file (not all are necessarily valid)")
+                break
+
+            if line and self._is_valid_source_ref(line, line_number):
+                attributes = self._get_attributes_from_line(line, line_number)
+                if attributes:
+                    validated_line = self._validate_line(line, attributes,
+                                                         line_number, current_manifest_stats)
+                    if validated_line:
+                        sanitized_manifest.append(validated_line)
+                        current_manifest_stats.valid_line_count += 1
+                elif self._source_ref_only(line):
+                    current_manifest_stats.source_ref_only_line_count += 1
+
+            line_number += 1
+            current_manifest_stats.total_line_count += 1
+
+        return sanitized_manifest, current_manifest_stats + existing_manifest_stats
+
+
+stats = GroundTruthManifestStatistics()
+validator = GroundTruthManifestValidator()
+manif, stats2 = validator.validate_manifest(open(f'data/train_{manifest_version}.manifest', 'r'), stats)
+print(stats2)
+print('--------------------------------------------------------------------------------------')
+manif, stats2 = validator.validate_manifest(open(f'data/test_{manifest_version}.manifest', 'r'), stats)
+print(stats2)
+
+
+
+s3.upload_file(f'data/train_{manifest_version}.manifest', reko_bucket, f"datasets/{reko_manifest_path}-{manifest_version}-train/manifests/output/output.manifest")
+s3.upload_file(f'data/test_{manifest_version}.manifest', reko_bucket, f"datasets/{reko_manifest_path}-{manifest_version}-test/manifests/output/output.manifest")
+print(f"Train Manifest name: s3://{reko_bucket}/datasets/{reko_manifest_path}-{manifest_version}-train/manifests/output/output.manifest")
+print(f"Test Manifest name: s3://{reko_bucket}/datasets/{reko_manifest_path}-{manifest_version}-test/manifests/output/output.manifest")
+
+
+
+get_ipython().system('aws rekognition describe-projects')
+
+
+
+def get_project(project_name="construction-object-recognition-v3"):
+    try:
+        project = reko.create_project(ProjectName=project_name)['ProjectArn']
+        print("project created")
+    except reko.exceptions.ResourceInUseException:
+        project = 'arn:aws:rekognition:us-east-1:592627009550:project/construction-object-recognition-v3/1651592076773'
+    return(project)
+
+
+
+project = get_project()
+
+
+
+try:
+    isrunning_response = rekog_client.describe_project_versions(
+        ProjectArn=project
+    )
+except Exception as e:
+    print(e)
+version_number = len(isrunning_response['ProjectVersionDescriptions'])+ 1
+#version_number = len(reko.describe_project_versions(ProjectArn=project)['ProjectVersionDescriptions']) + 1
+version_name = f"constr-obj-rek-{manifest_version}-v{version_number}"
+print(version_name)
+
+
+
+
+TrainingData = {
+  "Assets": [ 
+     { 
+        "GroundTruthManifest": { 
+           "S3Object": { 
+              "Bucket": reko_bucket,
+              "Name": f"datasets/{reko_manifest_path}-{manifest_version}-train/manifests/output/output.manifest"
+           }
+        }
+     }
+  ]
+}
+TestingData = { 
+    "Assets": [ 
+        { 
+           "GroundTruthManifest": { 
+               "S3Object": { 
+                   "Bucket": reko_bucket,
+                   "Name": f"datasets/{reko_manifest_path}-{manifest_version}-test/manifests/output/output.manifest"
+               }
+           }
+        }
+    ],
+    "AutoCreate": False
+}
+OutputConfig = { 
+  "S3Bucket": bucket,
+  "S3KeyPrefix": output_path
+}
+print(f"Creating version {manifest_version}-v{version_number} for project {project}")
+
+
+
+
+
+TrainingData, TestingData
+
+[x for x in reko.describe_project_versions(ProjectArn=project)['ProjectVersionDescriptions'] if x['Status'] != 'TRAINING_FAILED']
+
+prj_version_arn = reko.create_project_version(ProjectArn=project, VersionName=version_name,
+      OutputConfig=OutputConfig, TrainingData=TrainingData, TestingData=TestingData)['ProjectVersionArn']
+
+
+
+
+def start_model(project_arn, model_arn, version_name, min_inference_units, client):
+
+    try:
+        # Start the model
+        print('Starting model: ' + model_arn)
+        response=client.start_project_version(ProjectVersionArn=model_arn, MinInferenceUnits=min_inference_units)
+        # Wait for the model to be in the running state
+        project_version_running_waiter = client.get_waiter('project_version_running')
+        project_version_running_waiter.wait(ProjectArn=project_arn, VersionNames=[version_name])
+
+        #Get the running status
+        describe_response=client.describe_project_versions(ProjectArn=project_arn,
+            VersionNames=[version_name])
+        for model in describe_response['ProjectVersionDescriptions']:
+            print("Status: " + model['Status'])
+            print("Message: " + model['StatusMessage']) 
+    except Exception as e:
+        print(e)
+        
+    print('Done...')
+    
+def stop_model(model_arn, client):
+
+    print('Stopping model:' + model_arn)
+
+    try:
+        response=client.stop_project_version(ProjectVersionArn=model_arn)
+        status=response['Status']
+        print ('Status: ' + status)
+    except Exception as e:  
+        print(e)  
+
+    print('Done...')
+
+
+
+import io
+from PIL import ImageDraw, ExifTags, ImageColor, ImageFont
+
+def show_custom_labels(model,bucket,photo, min_confidence, client):
+  
+    s3_connection = boto3.resource('s3')
+
+    s3_object = s3_connection.Object(bucket,photo)
+    s3_response = s3_object.get()
+
+    stream = io.BytesIO(s3_response['Body'].read())
+    image=Imagem.open(stream)
+    
+    response = client.detect_custom_labels(Image={'S3Object': {'Bucket': bucket, 'Name': photo}},
+        MinConfidence=min_confidence,
+        ProjectVersionArn=model)
+   
+   
+    imgWidth, imgHeight = image.size  
+    draw = ImageDraw.Draw(image)
+
+    for customLabel in response['CustomLabels']:
+      
+        if 'Geometry' in customLabel:
+            if customLabel['Confidence'] > 67:
+                fill_color = '#00d400'
+            elif customLabel['Confidence'] > 33:
+                fill_color = '#f0d802'
+            else:
+                fill_color = '#ed1000'
+            box = customLabel['Geometry']['BoundingBox']
+            left = imgWidth * box['Left']
+            top = imgHeight * box['Top']
+            width = imgWidth * box['Width']
+            height = imgHeight * box['Height']
+            draw.text((left,top), customLabel['Name'], fill='white') 
+           
+
+            points = (
+                (left,top),
+                (left + width, top),
+                (left + width, top + height),
+                (left , top + height),
+                (left, top))
+            draw.line(points, fill=fill_color, width=5)
+
+    return({label['Name'] for label in response['CustomLabels']}, response['CustomLabels'], image)
+
+
+
+
+start_model(project_arn=project, 
+            model_arn=prj_version_arn,
+            version_name=version_name,
+            min_inference_units=1, 
+            client=reko
+           )
+
+
+
+labels, response, image = show_custom_labels(
+    model=prj_version_arn,
+    bucket=bucket, 
+    photo=f'cl-demo/input/{test_data[0].filename}',
+    min_confidence=20,
+    client=reko
+)
+
+
+image
+
+stop_model(model_arn=prj_version_arn, client=reko)
+
